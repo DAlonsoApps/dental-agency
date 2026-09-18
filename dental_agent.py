@@ -70,6 +70,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.errors import GraphRecursionError
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
+from psycopg.types.json import Json
 
 from calendar_client import CalendarClient, GoogleCalendarClient, FakeCalendarClient
 
@@ -241,87 +242,162 @@ def last_reply_text(messages: list) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Clinic configuration
+# Clinic configuration -- name, phone, timezone, slot length, services,
+# working hours, and the FAQ knowledge base. This is EVERYTHING that would
+# need to change to reuse this codebase for a different clinic or
+# business, which is exactly the point of storing it in Postgres instead
+# of hardcoding it here: when DATABASE_URL is set, all of this lives in
+# one row of a `clinic_config` table (as JSON) that you edit directly in
+# the database -- no redeploy needed, no touching this file at all. When
+# DATABASE_URL isn't set, the example/placeholder config below is used
+# as-is, exactly like before this migration.
 # ---------------------------------------------------------------------------
 
-CLINIC_NAME = "Bright Smile Dental Clinic"
-CLINIC_PHONE = "+34 93 000 00 00"  # TODO: replace with the real clinic phone number
-CLINIC_TIMEZONE = ZoneInfo("Europe/Madrid")  # Barcelona's timezone (handles CET/CEST automatically)
+def _default_clinic_config() -> dict:
+    """The example/placeholder clinic config baked into the code. Used as
+    (a) the fallback when DATABASE_URL isn't set, and (b) the seed data
+    written to a clinic's Postgres database the very first time it's used,
+    so there's a real, editable starting point rather than an empty row.
 
-SERVICES = [
-    "Dental cleaning",
-    "General checkup",
-    "Filling",
-    "Extraction",
-    "Orthodontics consultation",
-]
+    TODO: replace every placeholder value below with the clinic's real
+    information -- this is clearly-marked example content only, not real
+    prices or a real address. If DATABASE_URL is set, the easiest way to
+    change these for a real deployment is to edit the `clinic_config` row
+    directly in the database instead of this function (see the module
+    comment above) -- editing this function only changes what a *new*,
+    never-before-used database gets seeded with."""
+    services = [
+        "Dental cleaning",
+        "General checkup",
+        "Filling",
+        "Extraction",
+        "Orthodontics consultation",
+    ]
+    return {
+        "clinic_name": "Bright Smile Dental Clinic",
+        "clinic_phone": "+34 93 000 00 00",
+        "clinic_timezone": "Europe/Madrid",  # IANA name; handles CET/CEST automatically
+        "slot_minutes": 30,
+        "services": services,
+        # weekday (JSON keys are always strings) -> [opens, closes] as
+        # "HH:MM" 24h strings. Monday="0" ... Sunday="6". A day missing
+        # from this dict is treated as closed (e.g. Sunday).
+        "working_hours": {
+            "0": ["09:00", "19:00"],  # Monday
+            "1": ["09:00", "19:00"],  # Tuesday
+            "2": ["09:00", "19:00"],  # Wednesday
+            "3": ["09:00", "19:00"],  # Thursday
+            "4": ["09:00", "19:00"],  # Friday
+            "5": ["09:00", "14:00"],  # Saturday
+            # "6" (Sunday) intentionally omitted: clinic is closed.
+        },
+        "faq_kb": [
+            {
+                "topic": "services",
+                "keywords": ["service", "services", "treatment", "treatments", "offer",
+                             "cleaning", "checkup", "check-up", "filling", "extraction",
+                             "orthodontics", "ortho", "braces"],
+                "answer": f"We offer: {', '.join(services)}.",
+            },
+            {
+                "topic": "prices",
+                "keywords": ["price", "prices", "cost", "costs", "fee", "fees",
+                             "how much", "euro", "€", "expensive", "cheap"],
+                "answer": (
+                    "[EXAMPLE PRICES — replace with real ones] General checkup: €40. "
+                    "Dental cleaning: €60. Filling: from €70. Extraction: from €90. "
+                    "Orthodontics consultation: €50 (often deducted from treatment "
+                    "cost if the patient proceeds). Final cost is always confirmed "
+                    "at the visit."
+                ),
+            },
+            {
+                "topic": "location",
+                "keywords": ["location", "address", "where", "located", "directions", "map"],
+                "answer": (
+                    "[EXAMPLE ADDRESS — replace with the real one] Bright Smile Dental "
+                    "Clinic is located at Carrer de Balmes 123, 08008 Barcelona, close "
+                    "to Diagonal metro station (L3/L5)."
+                ),
+            },
+            {
+                "topic": "parking",
+                "keywords": ["parking", "park", "car park", "garage"],
+                "answer": (
+                    "[EXAMPLE — replace with real info] There is no dedicated clinic "
+                    "parking, but a public car park is a short walk away, and there "
+                    "is metered street parking nearby on weekdays."
+                ),
+            },
+            {
+                "topic": "insurance",
+                "keywords": ["insurance", "insurer", "cover", "covered", "adeslas",
+                             "sanitas", "dkv", "asisa", "mapfre"],
+                "answer": (
+                    "[EXAMPLE — replace with the clinic's real accepted insurers] We "
+                    "accept most major Spanish dental insurers, including Adeslas, "
+                    "Sanitas, DKV, Asisa, and Mapfre. Coverage and co-pays depend on "
+                    "the patient's specific policy, so ask them to bring their "
+                    "insurance card to the appointment to confirm exact coverage."
+                ),
+            },
+        ],
+    }
+
+
+def _load_clinic_config() -> dict:
+    """Load clinic config from Postgres if DATABASE_URL is configured,
+    seeding the database with the example config the very first time (if
+    the table is empty) so there's a real row to edit going forward.
+    Falls back to the hardcoded example config directly (with a loud
+    warning) if DATABASE_URL isn't set."""
+    pool = _get_pg_pool()
+    if pool is not None:
+        with pool.connection() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS clinic_config (id INTEGER PRIMARY KEY, config JSONB NOT NULL)"
+            )
+            row = conn.execute("SELECT config FROM clinic_config WHERE id = 1").fetchone()
+            if row is not None:
+                return row["config"]
+            default = _default_clinic_config()
+            conn.execute(
+                "INSERT INTO clinic_config (id, config) VALUES (1, %s)",
+                (Json(default),),
+            )
+            return default
+    print(
+        "WARNING: DATABASE_URL not set -- using the hardcoded example "
+        "clinic config instead of Postgres. To customize this for a real "
+        "clinic without touching code, set DATABASE_URL and edit the "
+        "`clinic_config` row in the database instead. See "
+        "dental_agent.py's _load_clinic_config() for details.",
+        file=sys.stderr,
+    )
+    return _default_clinic_config()
+
+
+_CLINIC_CONFIG = _load_clinic_config()
+
+CLINIC_NAME = _CLINIC_CONFIG["clinic_name"]
+CLINIC_PHONE = _CLINIC_CONFIG["clinic_phone"]
+CLINIC_TIMEZONE = ZoneInfo(_CLINIC_CONFIG["clinic_timezone"])  # handles CET/CEST etc. automatically
+
+# How long a single appointment slot is. Used both to generate candidate
+# slot start times for get_available_slots and as the event duration when
+# booking.
+SLOT_MINUTES = _CLINIC_CONFIG["slot_minutes"]
+
+SERVICES = _CLINIC_CONFIG["services"]
 
 # weekday() -> (opening time, closing time). Monday=0 ... Sunday=6.
 # A day missing from this dict is treated as closed (e.g. Sunday).
 WORKING_HOURS: dict[int, tuple[dt_time, dt_time]] = {
-    0: (dt_time(9, 0), dt_time(19, 0)),  # Monday
-    1: (dt_time(9, 0), dt_time(19, 0)),  # Tuesday
-    2: (dt_time(9, 0), dt_time(19, 0)),  # Wednesday
-    3: (dt_time(9, 0), dt_time(19, 0)),  # Thursday
-    4: (dt_time(9, 0), dt_time(19, 0)),  # Friday
-    5: (dt_time(9, 0), dt_time(14, 0)),  # Saturday
-    # 6 (Sunday) intentionally omitted: clinic is closed.
+    int(weekday): (dt_time.fromisoformat(opens), dt_time.fromisoformat(closes))
+    for weekday, (opens, closes) in _CLINIC_CONFIG["working_hours"].items()
 }
 
-# TODO: replace every value below with the clinic's real information — this
-# is placeholder/example content only, clearly not real prices or an address.
-FAQ_KB: list[dict] = [
-    {
-        "topic": "services",
-        "keywords": ["service", "services", "treatment", "treatments", "offer",
-                     "cleaning", "checkup", "check-up", "filling", "extraction",
-                     "orthodontics", "ortho", "braces"],
-        "answer": f"We offer: {', '.join(SERVICES)}.",
-    },
-    {
-        "topic": "prices",
-        "keywords": ["price", "prices", "cost", "costs", "fee", "fees",
-                     "how much", "euro", "€", "expensive", "cheap"],
-        "answer": (
-            "[EXAMPLE PRICES — replace with real ones] General checkup: €40. "
-            "Dental cleaning: €60. Filling: from €70. Extraction: from €90. "
-            "Orthodontics consultation: €50 (often deducted from treatment "
-            "cost if the patient proceeds). Final cost is always confirmed "
-            "at the visit."
-        ),
-    },
-    {
-        "topic": "location",
-        "keywords": ["location", "address", "where", "located", "directions",
-                      "map"],
-        "answer": (
-            f"[EXAMPLE ADDRESS — replace with the real one] {CLINIC_NAME} is "
-            "located at Carrer de Balmes 123, 08008 Barcelona, close to "
-            "Diagonal metro station (L3/L5)."
-        ),
-    },
-    {
-        "topic": "parking",
-        "keywords": ["parking", "park", "car park", "garage"],
-        "answer": (
-            "[EXAMPLE — replace with real info] There is no dedicated clinic "
-            "parking, but a public car park is a short walk away, and there "
-            "is metered street parking nearby on weekdays."
-        ),
-    },
-    {
-        "topic": "insurance",
-        "keywords": ["insurance", "insurer", "cover", "covered", "adeslas",
-                     "sanitas", "dkv", "asisa", "mapfre"],
-        "answer": (
-            "[EXAMPLE — replace with the clinic's real accepted insurers] We "
-            "accept most major Spanish dental insurers, including Adeslas, "
-            "Sanitas, DKV, Asisa, and Mapfre. Coverage and co-pays depend on "
-            "the patient's specific policy, so ask them to bring their "
-            "insurance card to the appointment to confirm exact coverage."
-        ),
-    },
-]
+FAQ_KB: list[dict] = _CLINIC_CONFIG["faq_kb"]
 
 # ---------------------------------------------------------------------------
 # Booking backend — a real calendar is the source of truth for availability
@@ -330,11 +406,6 @@ FAQ_KB: list[dict] = [
 # the CalendarClient interface, the real Google Calendar implementation, and
 # setup instructions.
 # ---------------------------------------------------------------------------
-
-# How long a single appointment slot is. Used both to generate candidate
-# slot start times for get_available_slots and as the event duration when
-# booking. Change this if the clinic wants a different default length.
-SLOT_MINUTES = 30
 
 
 def _build_calendar_client() -> CalendarClient:

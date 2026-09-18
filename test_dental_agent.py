@@ -392,6 +392,79 @@ class TestPostgresBookingsStore:
         assert "Dave Mai" in result
 
 
+@pytest.mark.skipif(
+    not os.environ.get("TEST_DATABASE_URL"),
+    reason="set TEST_DATABASE_URL to a real (throwaway) Postgres database to run these",
+)
+class TestPostgresClinicConfig:
+    """Opt-in integration tests against a REAL Postgres database. Verifies
+    Stage 3 of the Neon migration: clinic name/phone/hours/services/FAQ
+    live in one editable database row instead of hardcoded Python -- the
+    piece that lets this codebase be reused for a different clinic or
+    business via a config edit instead of a code fork.
+
+    Run with, e.g., the same local Postgres used for the other Postgres
+    test classes:
+        TEST_DATABASE_URL=postgresql://postgres:testpass@localhost:5432/dental_agent_test \\
+            pytest test_dental_agent.py -v -k PostgresClinicConfig
+
+    Never point this at your real Neon database -- it creates, edits, and
+    reads a real clinic_config row. Use a disposable local/test database.
+    """
+
+    def setup_method(self):
+        os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
+        pool = agent._get_pg_pool()
+        with pool.connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS clinic_config")
+
+    def teardown_method(self):
+        agent.close_database()
+        os.environ.pop("DATABASE_URL", None)
+
+    def test_seeds_an_empty_database_with_the_default_config(self):
+        config = agent._load_clinic_config()
+        assert config == agent._default_clinic_config()
+
+        # And it's actually persisted, not just returned in memory.
+        pool = agent._get_pg_pool()
+        with pool.connection() as conn:
+            row = conn.execute("SELECT config FROM clinic_config WHERE id = 1").fetchone()
+        assert row["config"]["clinic_name"] == agent._default_clinic_config()["clinic_name"]
+
+    def test_reads_an_existing_row_without_reseeding(self):
+        pool = agent._get_pg_pool()
+        custom = agent._default_clinic_config()
+        custom["clinic_name"] = "Second Test Clinic"
+        with pool.connection() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS clinic_config (id INTEGER PRIMARY KEY, config JSONB NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO clinic_config (id, config) VALUES (1, %s)",
+                (agent.Json(custom),),
+            )
+
+        loaded = agent._load_clinic_config()
+        assert loaded["clinic_name"] == "Second Test Clinic"
+
+    def test_editing_the_database_row_changes_the_next_load_with_no_code_changes(self):
+        """The actual point of Stage 3, proven end to end: seed the
+        database, edit ONLY the row (no Python, no redeploy), and confirm
+        the next load picks up the edit."""
+        agent._load_clinic_config()  # seeds it
+
+        pool = agent._get_pg_pool()
+        with pool.connection() as conn:
+            conn.execute(
+                "UPDATE clinic_config SET config = jsonb_set(config, '{clinic_name}', %s::jsonb) WHERE id = 1",
+                (agent.Json("Second Test Clinic"),),
+            )
+
+        reloaded = agent._load_clinic_config()
+        assert reloaded["clinic_name"] == "Second Test Clinic"
+
+
 # ---------------------------------------------------------------------------
 # Tier 1: calendar-backed booking tools
 # ---------------------------------------------------------------------------
