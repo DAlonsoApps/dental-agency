@@ -1,0 +1,628 @@
+"""
+Test suite for dental_agent.py.
+
+Run with:
+    pytest test_dental_agent.py -v
+
+Put this file in the same folder as dental_agent.py.
+
+Three tiers, in increasing order of cost/flakiness:
+
+  Tier 1 - Unit tests (TestBookingValidation, TestFindAppointment,
+  TestGetCurrentDatetime, TestFaqSearch): pure Python logic, no LLM calls,
+  no network, no cost, fully deterministic. Run these EVERY time you touch
+  the code — they take well under a second.
+
+  Tier 2 - Structural/integration tests (TestGraphStructure,
+  TestSupervisorSafetyNet, TestMultiAgentFlowOffline): exercise the actual
+  LangGraph wiring end-to-end, but with fake LLM objects standing in for
+  Claude, so still zero cost and fully deterministic. Run these every time
+  too — they're what would have caught the routing hang before it ever
+  reached a terminal.
+
+  Tier 3 - Live behavioral/quality scenarios (GOLDEN_SCENARIOS +
+  test_golden_scenario): run the REAL model end-to-end against a fixed list
+  of scenarios (Sunday requests, emergency deflection, identity checks,
+  etc.) to catch quality regressions after a prompt or model change. These
+  cost tokens, take longer, and are somewhat fuzzy since model wording
+  varies — they're opt-in, not run by default.
+"""
+
+import os
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+import dental_agent as agent
+
+# Captured before the autouse reset_bookings fixture patches
+# agent._save_bookings_index to a no-op for every other test -- this keeps
+# a reference to the REAL function so TestBookingsIndexPersistence can
+# still exercise actual file I/O (against a tmp_path, never a real file).
+_REAL_SAVE_BOOKINGS_INDEX = agent._save_bookings_index
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def reset_bookings(monkeypatch):
+    """Every test starts and ends with a clean in-memory booking list AND a
+    fresh, empty FakeCalendarClient, so tests can never leak state into each
+    other regardless of order or of what got "booked" on the fake calendar.
+
+    Also disables the on-disk bookings-index persistence added to fix the
+    "restart wipes the agent's memory of existing bookings" bug -- the
+    offline tests should never touch a real file on disk, and don't need
+    to: they only care about BOOKINGS' in-memory behavior for the duration
+    of each test."""
+    agent.BOOKINGS.clear()
+    agent._next_id_counter = 1000
+    agent.calendar_client = agent.FakeCalendarClient()
+    monkeypatch.setattr(agent, "_save_bookings_index", lambda: None)
+    yield
+    agent.BOOKINGS.clear()
+
+
+def _extract_id(confirmation_text: str) -> str:
+    """Pull 'APT-1001' out of a book_appointment confirmation string."""
+    return confirmation_text.split("ID ")[1].split(" ")[0]
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: booking validation logic
+# ---------------------------------------------------------------------------
+
+class TestBookingValidation:
+    def test_rejects_malformed_date(self):
+        result = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "16-09-2026", "time": "10:00"}
+        )
+        assert "not a valid date" in result
+
+    def test_rejects_malformed_time(self):
+        result = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-16", "time": "10h00"}
+        )
+        assert "not a valid time" in result
+
+    def test_rejects_sunday(self):
+        # 2026-09-20 is a Sunday.
+        result = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-20", "time": "10:00"}
+        )
+        assert "closed on Sundays" in result
+
+    def test_rejects_saturday_after_hours(self):
+        # 2026-09-19 is a Saturday; clinic closes at 14:00 that day.
+        result = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-19", "time": "15:00"}
+        )
+        assert "outside working hours" in result
+
+    def test_accepts_saturday_within_hours(self):
+        result = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-19", "time": "09:30"}
+        )
+        assert "confirmed" in result.lower()
+
+    def test_rejects_weekday_evening(self):
+        # Weekday closing time is 19:00.
+        result = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-16", "time": "20:00"}
+        )
+        assert "outside working hours" in result
+
+    def test_rejects_double_booking(self):
+        agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-16", "time": "09:00"}
+        )
+        result = agent.book_appointment.invoke(
+            {"patient_name": "B", "phone": "2", "date": "2026-09-16", "time": "09:00"}
+        )
+        assert "already booked" in result
+
+    def test_cancel_frees_the_slot(self):
+        confirmation = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-17", "time": "10:30"}
+        )
+        appt_id = _extract_id(confirmation)
+        before = agent.get_available_slots.invoke({"date": "2026-09-17"})
+        assert "10:30" not in before
+
+        cancel_result = agent.cancel_appointment.invoke({"appointment_id": appt_id})
+        assert "cancelled" in cancel_result
+
+        after = agent.get_available_slots.invoke({"date": "2026-09-17"})
+        assert "10:30" in after
+
+    def test_cancel_unknown_id(self):
+        result = agent.cancel_appointment.invoke({"appointment_id": "APT-9999"})
+        assert "No appointment found" in result
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: find_appointment identity-verification logic
+# ---------------------------------------------------------------------------
+
+class TestFindAppointment:
+    def _seed(self):
+        agent.book_appointment.invoke(
+            {"patient_name": "Maria Garcia", "phone": "600111222",
+             "date": "2026-09-16", "time": "09:00", "service": "Dental cleaning"}
+        )
+        agent.book_appointment.invoke(
+            {"patient_name": "Maria Garcia", "phone": "600333444",
+             "date": "2026-09-17", "time": "10:30", "service": "Filling"}
+        )
+
+    def test_lookup_by_id_alone_is_sufficient(self):
+        confirmation = agent.book_appointment.invoke(
+            {"patient_name": "John Smith", "phone": "600555666",
+             "date": "2026-09-18", "time": "09:00"}
+        )
+        appt_id = _extract_id(confirmation)
+        result = agent.find_appointment.invoke({"appointment_id": appt_id})
+        assert "John Smith" in result
+
+    def test_single_criterion_is_rejected(self):
+        self._seed()
+        result = agent.find_appointment.invoke({"patient_name": "Maria Garcia"})
+        assert "at least two" in result
+        assert "Maria Garcia" not in result  # must not leak booking details
+
+    def test_date_without_time_does_not_count_as_a_criterion(self):
+        self._seed()
+        result = agent.find_appointment.invoke({"date": "2026-09-16"})
+        assert "at least two" in result
+
+    def test_two_criteria_disambiguates_same_name(self):
+        self._seed()
+        result = agent.find_appointment.invoke(
+            {"patient_name": "Maria Garcia", "phone": "600333444"}
+        )
+        assert "2026-09-17" in result
+        assert "2026-09-16" not in result
+
+    def test_no_match_found(self):
+        self._seed()
+        result = agent.find_appointment.invoke(
+            {"patient_name": "Nobody Here", "phone": "000000000"}
+        )
+        assert "No appointment found" in result
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: clock and FAQ tools
+# ---------------------------------------------------------------------------
+
+class TestGetCurrentDatetime:
+    def test_returns_a_barcelona_timestamp(self):
+        from datetime import datetime
+        result = agent.get_current_datetime.invoke({})
+        assert "Barcelona" in result
+        # Sanity-check it actually contains today's real date, not a stale
+        # hardcoded value.
+        today_str = datetime.now(agent.CLINIC_TIMEZONE).strftime("%Y-%m-%d")
+        assert today_str in result
+
+
+class TestFaqSearch:
+    @pytest.mark.parametrize("query,expected_keyword", [
+        ("how much does a cleaning cost", "checkup"),
+        ("is there parking nearby", "parking"),
+        ("do you take Sanitas", "Adeslas"),  # insurance answer lists several accepted insurers
+        ("where is the clinic located", "Barcelona"),
+    ])
+    def test_known_topics_match(self, query, expected_keyword):
+        result = agent.search_clinic_faq.invoke({"query": query})
+        assert expected_keyword.lower() in result.lower()
+
+    def test_unmatched_query_gives_fallback(self):
+        result = agent.search_clinic_faq.invoke({"query": "do you sell toothbrushes"})
+        assert "Nothing in the clinic FAQ" in result
+        assert agent.CLINIC_PHONE in result
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: bookings-index persistence (regression tests for the "restart
+# wipes the agent's memory of existing bookings" bug)
+# ---------------------------------------------------------------------------
+
+class TestBookingsIndexPersistence:
+    def test_save_then_load_roundtrip(self, tmp_path, monkeypatch):
+        index_file = tmp_path / "bookings_index.json"
+        monkeypatch.setattr(agent, "BOOKINGS_INDEX_FILE", index_file)
+        monkeypatch.setattr(agent, "_save_bookings_index", _REAL_SAVE_BOOKINGS_INDEX)
+
+        agent.BOOKINGS[:] = [
+            {"id": "APT-1001", "event_id": "evt-1", "patient_name": "Dave Mai",
+             "phone": "666666666", "date": "2026-09-17", "time": "18:00", "service": "Orthodontics consultation"},
+        ]
+        agent._save_bookings_index()
+
+        assert index_file.exists()
+        loaded = agent._load_bookings_index()
+        assert loaded == agent.BOOKINGS
+
+    def test_find_appointment_survives_a_simulated_restart(self, tmp_path, monkeypatch):
+        """The exact bug: book an appointment, simulate the process
+        restarting (BOOKINGS reset to whatever _load_bookings_index()
+        returns), then confirm find_appointment can still see it."""
+        index_file = tmp_path / "bookings_index.json"
+        monkeypatch.setattr(agent, "BOOKINGS_INDEX_FILE", index_file)
+        monkeypatch.setattr(agent, "_save_bookings_index", _REAL_SAVE_BOOKINGS_INDEX)
+
+        confirmation = agent.book_appointment.invoke(
+            {"patient_name": "Dave Mai", "phone": "666666666",
+             "date": "2026-09-17", "time": "18:00", "service": "Orthodontics consultation"}
+        )
+        appt_id = _extract_id(confirmation)
+
+        # Simulate a fresh process: nothing left in memory except what
+        # gets reloaded from disk.
+        agent.BOOKINGS[:] = agent._load_bookings_index()
+
+        result = agent.find_appointment.invoke({"patient_name": "Dave Mai", "phone": "666666666"})
+        assert appt_id in result
+        assert "Dave Mai" in result
+
+    def test_next_counter_start_resumes_after_highest_loaded_id(self):
+        loaded = [{"id": "APT-1003"}, {"id": "APT-1007"}, {"id": "APT-1002"}]
+        assert agent._next_counter_start(loaded) == 1007
+
+    def test_next_counter_start_defaults_to_1000_when_empty(self):
+        assert agent._next_counter_start([]) == 1000
+
+    def test_corrupted_index_file_falls_back_to_empty_list(self, tmp_path):
+        index_file = tmp_path / "bookings_index.json"
+        index_file.write_text("{not valid json", encoding="utf-8")
+        # Point at the corrupted file directly rather than going through
+        # module state, so this test doesn't need any monkeypatching.
+        original = agent.BOOKINGS_INDEX_FILE
+        agent.BOOKINGS_INDEX_FILE = index_file
+        try:
+            assert agent._load_bookings_index() == []
+        finally:
+            agent.BOOKINGS_INDEX_FILE = original
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: calendar-backed booking tools
+# ---------------------------------------------------------------------------
+
+class _BrokenCalendarClient:
+    """Simulates the calendar being unreachable (network error, auth
+    failure, quota exceeded, ...) -- every method raises."""
+
+    def get_busy_intervals(self, day):
+        raise RuntimeError("simulated calendar outage")
+
+    def create_event(self, **kwargs):
+        raise RuntimeError("simulated calendar outage")
+
+    def delete_event(self, event_id):
+        raise RuntimeError("simulated calendar outage")
+
+
+class TestCalendarBackedTools:
+    def test_get_available_slots_reports_closed_day_directly(self):
+        # 2026-09-20 is a Sunday.
+        result = agent.get_available_slots.invoke({"date": "2026-09-20"})
+        assert "closed" in result.lower()
+
+    def test_booking_creates_a_real_calendar_event(self):
+        confirmation = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-16", "time": "09:00"}
+        )
+        appt_id = _extract_id(confirmation)
+        booking = agent._find_booking(appt_id)
+        assert booking["event_id"] in agent.calendar_client.events
+        event = agent.calendar_client.events[booking["event_id"]]
+        assert "A" in event["summary"]
+
+    def test_cancel_removes_the_calendar_event(self):
+        confirmation = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-16", "time": "09:00"}
+        )
+        appt_id = _extract_id(confirmation)
+        event_id = agent._find_booking(appt_id)["event_id"]
+        agent.cancel_appointment.invoke({"appointment_id": appt_id})
+        assert event_id not in agent.calendar_client.events
+
+    def test_calendar_outage_on_availability_check_is_reported_gracefully(self, monkeypatch):
+        monkeypatch.setattr(agent, "calendar_client", _BrokenCalendarClient())
+        result = agent.get_available_slots.invoke({"date": "2026-09-16"})
+        assert "trouble reaching" in result.lower()
+        assert agent.CLINIC_PHONE in result
+
+    def test_calendar_outage_on_booking_does_not_silently_succeed(self, monkeypatch):
+        """If the calendar is down, the tool must NOT create a local booking
+        record and claim success -- that would be a phantom appointment the
+        clinic can't see anywhere."""
+        monkeypatch.setattr(agent, "calendar_client", _BrokenCalendarClient())
+        result = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-16", "time": "09:00"}
+        )
+        assert "confirmed" not in result.lower()
+        assert agent.CLINIC_PHONE in result
+        assert agent.BOOKINGS == []
+
+    def test_calendar_outage_on_cancel_keeps_the_local_record(self, monkeypatch):
+        """If the calendar delete fails, the local booking must NOT be
+        removed -- otherwise the agent would forget an appointment that's
+        still sitting on the real calendar."""
+        confirmation = agent.book_appointment.invoke(
+            {"patient_name": "A", "phone": "1", "date": "2026-09-16", "time": "09:00"}
+        )
+        appt_id = _extract_id(confirmation)
+        monkeypatch.setattr(agent, "calendar_client", _BrokenCalendarClient())
+        result = agent.cancel_appointment.invoke({"appointment_id": appt_id})
+        assert "couldn't cancel" in result.lower()
+        assert agent._find_booking(appt_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# Tier 1: extract_text / last_reply_text content-normalization helpers
+# ---------------------------------------------------------------------------
+
+class TestLastReplyText:
+    def test_plain_string_content(self):
+        messages = [HumanMessage(content="hi"), AIMessage(content="Hello!")]
+        assert agent.last_reply_text(messages) == "Hello!"
+
+    def test_skips_trailing_empty_ai_message(self):
+        """The exact real-world shape that caused the original bug: a real
+        answer, then a later AIMessage with empty list content and no text."""
+        messages = [
+            HumanMessage(content="Can I get an appointment this Sunday?"),
+            AIMessage(content=[{"type": "tool_use", "id": "t1", "name": "get_current_datetime", "input": {}}]),
+            ToolMessage(content="Wednesday, 2026-09-16", tool_call_id="t1"),
+            AIMessage(content="We're closed Sundays -- how about Saturday or Monday instead?"),
+            AIMessage(content=[]),  # genuinely empty completion from a needless extra hop
+        ]
+        assert agent.last_reply_text(messages) == (
+            "We're closed Sundays -- how about Saturday or Monday instead?"
+        )
+
+    def test_all_empty_falls_back_to_generic_message(self):
+        messages = [HumanMessage(content="hi"), AIMessage(content=""), AIMessage(content=[])]
+        result = agent.last_reply_text(messages)
+        assert result  # never blank
+        assert "repeat" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: graph structure
+# ---------------------------------------------------------------------------
+
+class TestGraphStructure:
+    def test_build_graph_does_not_raise(self):
+        agent.build_graph()
+
+    def test_top_level_routing_edges(self):
+        graph = agent.build_graph()
+        g = graph.get_graph()
+        edge_pairs = {(e.source, e.target) for e in g.edges}
+        assert ("__start__", "supervisor") in edge_pairs
+        assert ("supervisor", "booking") in edge_pairs
+        assert ("supervisor", "faq") in edge_pairs
+        assert ("supervisor", "__end__") in edge_pairs
+        # Specialists must return control to the supervisor.
+        assert ("booking", "supervisor") in edge_pairs
+        assert ("faq", "supervisor") in edge_pairs
+
+    def test_specialist_subgraphs_have_agent_and_tools_nodes(self):
+        for subgraph in (agent.booking_subgraph, agent.faq_subgraph):
+            nodes = set(subgraph.get_graph().nodes.keys())
+            assert "agent" in nodes
+            assert "tools" in nodes
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: the hop-cap safety net (regression test for the hang we fixed)
+# ---------------------------------------------------------------------------
+
+class TestNoBulkBookingAccess:
+    """Structural guardrail: there must be no tool, and no code path, that
+    can return every patient's bookings at once. This is what actually
+    backs the 'unauthorized_data_access_list_all' scenario in
+    eval_scenarios.py -- the agent has no way to comply even if a clever
+    prompt convinced it to, because the capability doesn't exist."""
+
+    def test_no_tool_name_suggests_bulk_access(self):
+        all_tool_names = {t.name for t in agent.BOOKING_TOOLS} | {t.name for t in agent.FAQ_TOOLS}
+        forbidden_terms = ["list_all", "get_all", "all_appointments", "all_bookings", "dump", "export"]
+        for name in all_tool_names:
+            for term in forbidden_terms:
+                assert term not in name.lower(), f"Tool '{name}' looks like it could expose bulk booking data"
+
+    def test_find_appointment_with_no_arguments_reveals_nothing(self):
+        agent.book_appointment.invoke(
+            {"patient_name": "Secret Patient", "phone": "999999999",
+             "date": "2026-09-16", "time": "09:00"}
+        )
+        result = agent.find_appointment.invoke({})
+        assert "at least two" in result
+        assert "Secret Patient" not in result
+
+
+class TestSupervisorSafetyNet:
+    def test_at_cap_forces_finish_without_calling_the_llm(self, monkeypatch):
+        def _should_not_be_called(*args, **kwargs):
+            raise AssertionError("router_llm should not be invoked once the hop cap is reached")
+        monkeypatch.setattr(agent, "router_llm", type("X", (), {"invoke": staticmethod(_should_not_be_called)})())
+
+        state = {
+            "messages": [HumanMessage(content="test")],
+            "specialist_hops": agent.MAX_SPECIALIST_HOPS_PER_TURN,
+        }
+        result = agent.supervisor_node(state)
+        assert result == {"next": "FINISH"}
+
+
+class _FakeRoute:
+    def __init__(self, next):
+        self.next = next
+
+
+class _FakeRouterLLM:
+    """Returns a scripted sequence of routing decisions, repeating the last
+    one forever once the script runs out (simulates a router that keeps
+    wanting to route rather than finish).
+
+    Matches the real router_llm's contract: with_structured_output(...,
+    include_raw=True) returns a dict with "parsed" (the RouteDecision-like
+    object) and "raw" (the underlying AIMessage, used for token-usage
+    accounting). A plain AIMessage with no usage_metadata set is fine here
+    -- _usage_record() just skips it, so offline tests report zero cost."""
+    def __init__(self, sequence):
+        self._seq = list(sequence)
+        self._i = 0
+
+    def invoke(self, messages):
+        val = self._seq[min(self._i, len(self._seq) - 1)]
+        self._i += 1
+        return {"parsed": _FakeRoute(val), "raw": AIMessage(content="")}
+
+
+class _FakeSpecialistLLM:
+    def __init__(self, reply_text="OK, done.", on_call=None):
+        self.reply_text = reply_text
+        self._on_call = on_call
+
+    def invoke(self, messages):
+        if self._on_call:
+            self._on_call()
+        return AIMessage(content=self.reply_text)
+
+
+class TestMultiAgentFlowOffline:
+    """Full end-to-end graph runs with fake LLMs standing in for Claude:
+    zero API cost, fully deterministic, and exercises the real routing,
+    message-passing, and hop-counting logic."""
+
+    def _run(self, monkeypatch, router_sequence, booking_reply="Booked!", faq_reply="Here's the info."):
+        monkeypatch.setattr(agent, "router_llm", _FakeRouterLLM(router_sequence))
+        monkeypatch.setattr(
+            agent, "booking_subgraph",
+            agent._build_specialist_subgraph([], _FakeSpecialistLLM(booking_reply)),
+        )
+        monkeypatch.setattr(
+            agent, "faq_subgraph",
+            agent._build_specialist_subgraph([], _FakeSpecialistLLM(faq_reply)),
+        )
+        graph = agent.build_graph()
+        config = {"configurable": {"thread_id": "test-thread"}, "recursion_limit": 12}
+        return graph.invoke(
+            {"messages": [HumanMessage(content="hello")], "specialist_hops": 0},
+            config=config,
+        )
+
+    def test_single_hop_to_booking_then_finish(self, monkeypatch):
+        result = self._run(monkeypatch, router_sequence=["booking", "FINISH"])
+        assert result["messages"][-1].content == "Booked!"
+        assert result["specialist_hops"] == 1
+
+    def test_mixed_intent_visits_both_specialists(self, monkeypatch):
+        result = self._run(
+            monkeypatch,
+            router_sequence=["booking", "faq", "FINISH"],
+            booking_reply="Booked your slot.",
+            faq_reply="And yes, we take Sanitas.",
+        )
+        assert result["specialist_hops"] == 2
+        # Both replies should have made it into the shared conversation.
+        contents = [m.content for m in result["messages"]]
+        assert "Booked your slot." in contents
+        assert "And yes, we take Sanitas." in contents
+
+    def test_second_specialist_empty_completion_falls_back_to_first_reply(self, monkeypatch):
+        """Regression test for the 'blank final reply' bug: the supervisor
+        can take a needless second hop after a single-intent message is
+        already fully answered, and the model can legitimately return a
+        genuinely empty completion when asked to react to a conversation
+        that doesn't need anything more from it. When that happens, the
+        patient must still see the earlier, real answer -- not silence."""
+        result = self._run(
+            monkeypatch,
+            router_sequence=["booking", "faq", "FINISH"],
+            booking_reply="We're closed Sundays, how about Saturday instead?",
+            faq_reply="",  # simulates a real empty AIMessage completion
+        )
+        assert agent.last_reply_text(result["messages"]) == (
+            "We're closed Sundays, how about Saturday instead?"
+        )
+
+    def test_runaway_router_is_capped(self, monkeypatch):
+        """Regression test for the hang: a router that ALWAYS wants to route
+        to booking and never says FINISH must still be stopped at
+        MAX_SPECIALIST_HOPS_PER_TURN specialist calls, not 12+ (recursion
+        limit) or worse."""
+        call_count = {"n": 0}
+
+        def _count():
+            call_count["n"] += 1
+
+        monkeypatch.setattr(agent, "router_llm", _FakeRouterLLM(["booking"]))  # never says FINISH
+        monkeypatch.setattr(
+            agent, "booking_subgraph",
+            agent._build_specialist_subgraph([], _FakeSpecialistLLM("still working...", on_call=_count)),
+        )
+        graph = agent.build_graph()
+        config = {"configurable": {"thread_id": "test-runaway"}, "recursion_limit": 12}
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="anything")], "specialist_hops": 0},
+            config=config,
+        )
+        assert call_count["n"] <= agent.MAX_SPECIALIST_HOPS_PER_TURN
+        assert result["specialist_hops"] == agent.MAX_SPECIALIST_HOPS_PER_TURN
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: live behavioral/quality scenarios (real API, costs tokens, opt-in)
+# ---------------------------------------------------------------------------
+#
+# Run explicitly with:
+#     RUN_LIVE_TESTS=1 pytest test_dental_agent.py -v -k golden_scenario
+#
+# Do this after changing a system prompt, switching models, or before
+# showing this to someone else -- not on every save. Assertions here are
+# deliberately loose (keyword/structure checks), since exact wording from
+# the model will vary between runs.
+
+LIVE = os.environ.get("RUN_LIVE_TESTS") == "1"
+
+# Scenario definitions live in eval_scenarios.py, shared with run_evals.py
+# (which produces the scored report with cost/latency). Keeping one source
+# of truth means a new scenario you add is automatically covered by both
+# the quick pytest pass/fail check here and the detailed report there.
+from eval_scenarios import ALL_SCENARIOS  # noqa: E402
+
+
+@pytest.mark.skipif(not LIVE, reason="set RUN_LIVE_TESTS=1 (and a real ANTHROPIC_API_KEY) to run live scenarios")
+@pytest.mark.parametrize("scenario", ALL_SCENARIOS, ids=[s["name"] for s in ALL_SCENARIOS])
+def test_golden_scenario(scenario):
+    graph = agent.build_graph()
+    config = {"configurable": {"thread_id": f"golden-{scenario['name']}"}, "recursion_limit": 12}
+
+    reply = ""
+    for turn in scenario["turns"]:
+        result = graph.invoke(
+            {"messages": [HumanMessage(content=turn)], "specialist_hops": 0},
+            config=config,
+        )
+        reply = agent.last_reply_text(result["messages"])
+
+    reply_lower = reply.lower()
+    required = scenario["must_contain_any"]
+    if required:  # an empty list means "no positive requirement", not "must match nothing"
+        assert any(kw.lower() in reply_lower for kw in required), (
+            f"Scenario '{scenario['name']}': expected one of {required} "
+            f"in the reply, got:\n{reply}"
+        )
+    for forbidden in scenario["must_not_contain"]:
+        assert forbidden.lower() not in reply_lower, (
+            f"Scenario '{scenario['name']}': forbidden text '{forbidden}' found in reply:\n{reply}"
+        )

@@ -1,0 +1,17 @@
+# Secrets -- never commit these
+.env
+*.json
+!package.json
+service-account*.json
+
+# Local runtime data (source of truth is Google Calendar; these are just
+# local caches/logs, see dental_agent.py's comments)
+bookings_index.json
+transcripts/
+eval_reports/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
