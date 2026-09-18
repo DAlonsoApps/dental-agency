@@ -85,7 +85,7 @@ async def _lifespan(app: FastAPI):
     yield
     # Cleanly close the Postgres connection graph.checkpointer opened (if
     # any -- this is a no-op when running on MemorySaver).
-    agent.close_checkpointer()
+    agent.close_database()
 
 
 app = FastAPI(

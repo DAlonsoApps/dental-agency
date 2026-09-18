@@ -50,11 +50,20 @@ from psycopg_pool import ConnectionPool
 
 import dental_agent as agent
 
-# Captured before the autouse reset_bookings fixture patches
-# agent._save_bookings_index to a no-op for every other test -- this keeps
-# a reference to the REAL function so TestBookingsIndexPersistence can
-# still exercise actual file I/O (against a tmp_path, never a real file).
-_REAL_SAVE_BOOKINGS_INDEX = agent._save_bookings_index
+
+class _NullBookingsStore:
+    """No-op bookings store for offline tests -- BOOKINGS (the in-memory
+    list) is the only source of truth during a test; nothing is persisted
+    anywhere, so tests never touch a real file or database."""
+
+    def load_all(self):
+        return []
+
+    def add(self, booking):
+        pass
+
+    def remove(self, booking_id):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -67,15 +76,13 @@ def reset_bookings(monkeypatch):
     fresh, empty FakeCalendarClient, so tests can never leak state into each
     other regardless of order or of what got "booked" on the fake calendar.
 
-    Also disables the on-disk bookings-index persistence added to fix the
-    "restart wipes the agent's memory of existing bookings" bug -- the
-    offline tests should never touch a real file on disk, and don't need
-    to: they only care about BOOKINGS' in-memory behavior for the duration
-    of each test."""
+    Also swaps in a no-op bookings_store -- the offline tests should never
+    touch a real file or database, and don't need to: they only care about
+    BOOKINGS' in-memory behavior for the duration of each test."""
     agent.BOOKINGS.clear()
     agent._next_id_counter = 1000
     agent.calendar_client = agent.FakeCalendarClient()
-    monkeypatch.setattr(agent, "_save_bookings_index", lambda: None)
+    monkeypatch.setattr(agent, "bookings_store", _NullBookingsStore())
     yield
     agent.BOOKINGS.clear()
 
@@ -246,28 +253,32 @@ class TestFaqSearch:
 # ---------------------------------------------------------------------------
 
 class TestBookingsIndexPersistence:
-    def test_save_then_load_roundtrip(self, tmp_path, monkeypatch):
+    """Tests JsonFileBookingsStore -- the fallback backend used when
+    DATABASE_URL isn't set. Each test builds its own store pointed at a
+    pytest tmp_path, so none of this touches a real file. See
+    TestPostgresBookingsStore below for the real production backend."""
+
+    def test_save_then_load_roundtrip(self, tmp_path):
         index_file = tmp_path / "bookings_index.json"
-        monkeypatch.setattr(agent, "BOOKINGS_INDEX_FILE", index_file)
-        monkeypatch.setattr(agent, "_save_bookings_index", _REAL_SAVE_BOOKINGS_INDEX)
+        store = agent.JsonFileBookingsStore(index_file)
 
         agent.BOOKINGS[:] = [
             {"id": "APT-1001", "event_id": "evt-1", "patient_name": "Dave Mai",
              "phone": "666666666", "date": "2026-09-17", "time": "18:00", "service": "Orthodontics consultation"},
         ]
-        agent._save_bookings_index()
+        store.add(agent.BOOKINGS[0])
 
         assert index_file.exists()
-        loaded = agent._load_bookings_index()
+        loaded = store.load_all()
         assert loaded == agent.BOOKINGS
 
     def test_find_appointment_survives_a_simulated_restart(self, tmp_path, monkeypatch):
         """The exact bug: book an appointment, simulate the process
-        restarting (BOOKINGS reset to whatever _load_bookings_index()
+        restarting (BOOKINGS reset to whatever the store's load_all()
         returns), then confirm find_appointment can still see it."""
         index_file = tmp_path / "bookings_index.json"
-        monkeypatch.setattr(agent, "BOOKINGS_INDEX_FILE", index_file)
-        monkeypatch.setattr(agent, "_save_bookings_index", _REAL_SAVE_BOOKINGS_INDEX)
+        store = agent.JsonFileBookingsStore(index_file)
+        monkeypatch.setattr(agent, "bookings_store", store)
 
         confirmation = agent.book_appointment.invoke(
             {"patient_name": "Dave Mai", "phone": "666666666",
@@ -277,7 +288,7 @@ class TestBookingsIndexPersistence:
 
         # Simulate a fresh process: nothing left in memory except what
         # gets reloaded from disk.
-        agent.BOOKINGS[:] = agent._load_bookings_index()
+        agent.BOOKINGS[:] = store.load_all()
 
         result = agent.find_appointment.invoke({"patient_name": "Dave Mai", "phone": "666666666"})
         assert appt_id in result
@@ -293,14 +304,92 @@ class TestBookingsIndexPersistence:
     def test_corrupted_index_file_falls_back_to_empty_list(self, tmp_path):
         index_file = tmp_path / "bookings_index.json"
         index_file.write_text("{not valid json", encoding="utf-8")
-        # Point at the corrupted file directly rather than going through
-        # module state, so this test doesn't need any monkeypatching.
-        original = agent.BOOKINGS_INDEX_FILE
-        agent.BOOKINGS_INDEX_FILE = index_file
-        try:
-            assert agent._load_bookings_index() == []
-        finally:
-            agent.BOOKINGS_INDEX_FILE = original
+        store = agent.JsonFileBookingsStore(index_file)
+        assert store.load_all() == []
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TEST_DATABASE_URL"),
+    reason="set TEST_DATABASE_URL to a real (throwaway) Postgres database to run these",
+)
+class TestPostgresBookingsStore:
+    """Opt-in integration tests against a REAL Postgres database (never run
+    by default). Verifies the exact thing Stage 2 of the Neon migration is
+    for: that the booking index survives a brand new process pointed at
+    the same database -- the original bug report ("booked an appointment,
+    closed the agent, reopened it, and it couldn't find my booking") --
+    now with the index itself in Postgres instead of a local JSON file.
+
+    Run with, e.g., the same local Postgres used for TestPostgresCheckpointer:
+        TEST_DATABASE_URL=postgresql://postgres:testpass@localhost:5432/dental_agent_test \\
+            pytest test_dental_agent.py -v -k PostgresBookingsStore
+
+    Never point this at your real Neon database -- it creates and reads
+    real booking rows. Use a disposable local/test database instead.
+    """
+
+    def setup_method(self):
+        os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
+        # Start every test with an empty `bookings` table (creating it via
+        # PostgresBookingsStore's constructor if it doesn't exist yet), so
+        # these tests never see leftover rows from a previous run.
+        pool = agent._get_pg_pool()
+        with pool.connection() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS bookings ("
+                "id TEXT PRIMARY KEY, event_id TEXT NOT NULL, patient_name TEXT NOT NULL, "
+                "phone TEXT NOT NULL, date TEXT NOT NULL, time TEXT NOT NULL, service TEXT NOT NULL)"
+            )
+            conn.execute("DELETE FROM bookings")
+
+    def teardown_method(self):
+        agent.close_database()
+        os.environ.pop("DATABASE_URL", None)
+
+    def test_build_bookings_store_uses_postgres_when_database_url_is_set(self):
+        store = agent._build_bookings_store()
+        assert isinstance(store, agent.PostgresBookingsStore)
+
+    def test_add_load_remove_roundtrip(self):
+        store = agent.PostgresBookingsStore(agent._get_pg_pool())
+        booking = {
+            "id": "APT-9001", "event_id": "evt-9001", "patient_name": "Dave Mai",
+            "phone": "666666666", "date": "2026-09-17", "time": "18:00",
+            "service": "Orthodontics consultation",
+        }
+        store.add(booking)
+        assert store.load_all() == [booking]
+
+        store.remove("APT-9001")
+        assert store.load_all() == []
+
+    def test_table_creation_is_idempotent(self):
+        agent.PostgresBookingsStore(agent._get_pg_pool())
+        agent.PostgresBookingsStore(agent._get_pg_pool())  # must not raise
+
+    def test_find_appointment_survives_a_simulated_restart(self, monkeypatch):
+        """The original bug report, end to end: book an appointment with
+        the booking index in Postgres, close the process (close_database),
+        start a brand new one pointed at the same database, and confirm
+        find_appointment can still see the booking."""
+        monkeypatch.setattr(agent, "bookings_store", agent._build_bookings_store())
+        agent.BOOKINGS[:] = agent.bookings_store.load_all()
+
+        confirmation = agent.book_appointment.invoke(
+            {"patient_name": "Dave Mai", "phone": "666666666",
+             "date": "2026-09-17", "time": "18:00", "service": "Orthodontics consultation"}
+        )
+        appt_id = _extract_id(confirmation)
+
+        # Simulate the process exiting and a brand new one starting up,
+        # pointed at the same database.
+        agent.close_database()
+        fresh_store = agent._build_bookings_store()
+        agent.BOOKINGS[:] = fresh_store.load_all()
+
+        result = agent.find_appointment.invoke({"patient_name": "Dave Mai", "phone": "666666666"})
+        assert appt_id in result
+        assert "Dave Mai" in result
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +542,7 @@ class TestCheckpointerFallback:
     def test_close_checkpointer_is_a_harmless_noop_on_memory_saver(self, monkeypatch):
         monkeypatch.delenv("DATABASE_URL", raising=False)
         agent.build_graph()
-        agent.close_checkpointer()  # must not raise
+        agent.close_database()  # must not raise
 
 
 @pytest.mark.skipif(
@@ -479,7 +568,7 @@ class TestPostgresCheckpointer:
         os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 
     def teardown_method(self):
-        agent.close_checkpointer()
+        agent.close_database()
         os.environ.pop("DATABASE_URL", None)
 
     def test_build_graph_uses_postgres_saver_when_database_url_is_set(self):
@@ -490,7 +579,7 @@ class TestPostgresCheckpointer:
         # Calling build_graph() twice re-runs checkpointer.setup() against
         # tables that already exist -- must not raise.
         agent.build_graph()
-        agent.close_checkpointer()
+        agent.close_database()
         agent.build_graph()
 
     def test_conversation_history_survives_a_simulated_restart(self, monkeypatch):
@@ -512,7 +601,7 @@ class TestPostgresCheckpointer:
             {"messages": [HumanMessage(content="what are your hours?")], "specialist_hops": 0},
             config=config,
         )
-        agent.close_checkpointer()  # simulates the process exiting
+        agent.close_database()  # simulates the process exiting
 
         # Brand new checkpointer/connection, same database -- like a fresh
         # `python dental_agent.py` or a Render redeploy.
@@ -551,7 +640,7 @@ class TestPostgresCheckpointer:
 
         # Simulate the connection dying underneath the app -- kill every
         # connection actually sitting in the pool right now.
-        pool = agent._checkpointer_pool
+        pool = agent._pg_pool
         assert isinstance(pool, ConnectionPool)
         with pool.connection():
             pass  # make sure at least one connection has been opened

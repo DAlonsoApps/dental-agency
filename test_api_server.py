@@ -38,7 +38,7 @@ from fastapi.testclient import TestClient
 
 import dental_agent as agent
 import api_server
-from test_dental_agent import _FakeRouterLLM, _FakeSpecialistLLM
+from test_dental_agent import _FakeRouterLLM, _FakeSpecialistLLM, _NullBookingsStore
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +48,7 @@ def reset_state(monkeypatch):
     agent.BOOKINGS.clear()
     agent._next_id_counter = 1000
     agent.calendar_client = agent.FakeCalendarClient()
-    monkeypatch.setattr(agent, "_save_bookings_index", lambda: None)
+    monkeypatch.setattr(agent, "bookings_store", _NullBookingsStore())
     yield
     agent.BOOKINGS.clear()
 

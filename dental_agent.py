@@ -76,6 +76,70 @@ from calendar_client import CalendarClient, GoogleCalendarClient, FakeCalendarCl
 load_dotenv()
 
 
+# ---------------------------------------------------------------------------
+# Shared Postgres connection pool -- used for conversation memory (the
+# checkpointer, further down), the booking index (just below), and, from a
+# later stage, clinic FAQ/config data too. One shared pool rather than a
+# separate one per feature, both to stay well within Neon's free-tier
+# connection limits and because it only needs to be built once.
+#
+# IMPORTANT: this is a connection POOL (psycopg_pool.ConnectionPool), not a
+# single long-held connection. A single connection held open for the life
+# of the process WILL eventually go stale (Neon suspends its compute when
+# idle and drops connections; the same can happen from network blips, or
+# Render's server sleeping and waking up), and every request after that
+# would fail with "the connection is closed" until the process was
+# manually restarted. A pool checks each connection's health when it's
+# checked out (via `check=ConnectionPool.check_connection` below) and
+# transparently swaps in a fresh one if the old one died, so a stale
+# connection self-heals on the very next request instead of crashing it.
+# This was verified against a real Postgres instance by deliberately
+# killing the underlying connection mid-run and confirming the next
+# request still succeeds.
+# ---------------------------------------------------------------------------
+
+_pg_pool: ConnectionPool | None = None
+
+
+def _get_pg_pool() -> ConnectionPool | None:
+    """Lazily build (once) and return the shared Postgres connection pool,
+    or None if DATABASE_URL isn't configured. Safe to call repeatedly --
+    later calls just return the already-open pool."""
+    global _pg_pool
+    if _pg_pool is not None:
+        return _pg_pool
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        return None
+    _pg_pool = ConnectionPool(
+        conninfo=database_url,
+        # A dental clinic bot handles one conversation at a time per
+        # request, not a high-concurrency workload, and Neon's free tier
+        # caps concurrent connections -- keep this small rather than
+        # defaulting to psycopg_pool's normal (larger) sizing.
+        min_size=1,
+        max_size=5,
+        kwargs={"autocommit": True, "row_factory": dict_row},
+        # Validates a connection when it's checked out of the pool and
+        # transparently replaces it if it's gone stale -- this is the piece
+        # that actually makes the pool self-healing rather than just "a
+        # pool of connections that can still all be dead".
+        check=ConnectionPool.check_connection,
+        open=True,
+    )
+    return _pg_pool
+
+
+def close_database() -> None:
+    """Close the shared Postgres connection pool (if any) opened by
+    _get_pg_pool(). Call this on graceful shutdown (see api_server.py's
+    lifespan and main()'s exit path). Harmless to call even if no pool was
+    ever opened (e.g. running without DATABASE_URL configured)."""
+    global _pg_pool
+    if _pg_pool is not None:
+        _pg_pool.close()
+        _pg_pool = None
+
 
 # Block types we know carry no user-facing text, and are safe to silently
 # skip when normalizing content. Anything NOT in this list and NOT a
@@ -303,46 +367,146 @@ calendar_client: CalendarClient = _build_calendar_client()
 # (the calendar is). It lets find_appointment/cancel_appointment work by ID
 # or by patient details without an extra API round-trip.
 #
-# IMPORTANT: this index is persisted to a small JSON file on disk (see
-# _load_bookings_index/_save_bookings_index below). The Google Calendar
-# switch made the *appointments themselves* durable, but this index --
-# which is what find_appointment/cancel_appointment actually search -- was
-# still a bare in-memory list, so it was wiped on every restart exactly
-# like before. Without this, a patient could book an appointment, close
-# the script, reopen it, and the agent would have no way to find or cancel
-# a booking that genuinely still exists on the calendar. This file is a
-# cache the agent rebuilds its memory from, not a second source of truth
-# for availability -- that's still always the calendar.
+# IMPORTANT: this index is persisted via `bookings_store` below -- either a
+# Postgres table (when DATABASE_URL is set) or a small local JSON file as a
+# fallback. Either way, this fixes the same underlying problem the Google
+# Calendar switch didn't: the *appointments themselves* became durable on
+# the calendar, but this index -- which is what find_appointment and
+# cancel_appointment actually search -- was still a bare in-memory list
+# that got wiped on every restart. Without this, a patient could book an
+# appointment, the process could restart (Render redeploy, sleep/wake,
+# crash), and the agent would have no way to find or cancel a booking that
+# genuinely still exists on the calendar. This index is a cache the agent
+# rebuilds its memory from, not a second source of truth for availability
+# -- that's still always the calendar.
+
+
+class JsonFileBookingsStore:
+    """Fallback booking-index backend used only when DATABASE_URL isn't
+    set. Persists the whole index to a local JSON file on every add/remove.
+
+    NOTE: on a host with no persistent disk (e.g. Render's free tier) this
+    file is wiped on every restart/redeploy -- exactly the problem
+    PostgresBookingsStore (and setting DATABASE_URL) fixes. This is meant
+    for local development without a database configured, not production."""
+
+    def __init__(self, path: Path):
+        self._path = path
+
+    def load_all(self) -> list[dict]:
+        if not self._path.exists():
+            return []
+        try:
+            return json.loads(self._path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            print(
+                f"WARNING: could not read {self._path} ({exc}); starting "
+                "with an empty booking index. Existing calendar events are "
+                "unaffected, but the agent won't be able to find/cancel "
+                "them by ID or patient details until re-synced.",
+                file=sys.stderr,
+            )
+            return []
+
+    def _save_all(self) -> None:
+        """Rewrites the whole file from the current BOOKINGS list.
+        Best-effort: a failed save shouldn't crash the turn (the patient
+        already has their confirmation), but it does mean this index could
+        drift from reality until the next successful save, so we warn
+        loudly rather than failing silently."""
+        try:
+            self._path.write_text(
+                json.dumps(BOOKINGS, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError as exc:
+            print(f"WARNING: could not save booking index to {self._path} ({exc}).", file=sys.stderr)
+
+    def add(self, booking: dict) -> None:
+        # Ignores `booking` and just re-serializes the current BOOKINGS
+        # list -- fine for a JSON file (there's no cheaper "append" for a
+        # whole-file format), and the caller is always expected to have
+        # already appended to BOOKINGS before calling this.
+        self._save_all()
+
+    def remove(self, booking_id: str) -> None:
+        self._save_all()
+
+
+class PostgresBookingsStore:
+    """Real production booking-index backend: persists directly to a
+    Postgres table via the shared connection pool (_get_pg_pool()). Unlike
+    the JSON file fallback, this does a targeted INSERT/DELETE per booking
+    rather than rewriting everything, since a real table supports that
+    naturally."""
+
+    def __init__(self, pool: ConnectionPool):
+        self._pool = pool
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bookings (
+                    id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    patient_name TEXT NOT NULL,
+                    phone TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    time TEXT NOT NULL,
+                    service TEXT NOT NULL
+                )
+                """
+            )
+
+    def load_all(self) -> list[dict]:
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT id, event_id, patient_name, phone, date, time, service "
+                "FROM bookings ORDER BY id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add(self, booking: dict) -> None:
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO bookings (id, event_id, patient_name, phone, date, time, service)
+                VALUES (%(id)s, %(event_id)s, %(patient_name)s, %(phone)s, %(date)s, %(time)s, %(service)s)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                booking,
+            )
+
+    def remove(self, booking_id: str) -> None:
+        with self._pool.connection() as conn:
+            conn.execute("DELETE FROM bookings WHERE id = %s", (booking_id,))
+
+
 BOOKINGS_INDEX_FILE = Path(os.environ.get("BOOKINGS_INDEX_FILE", "bookings_index.json"))
 
 
-def _load_bookings_index() -> list[dict]:
-    if not BOOKINGS_INDEX_FILE.exists():
-        return []
-    try:
-        return json.loads(BOOKINGS_INDEX_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        print(
-            f"WARNING: could not read {BOOKINGS_INDEX_FILE} ({exc}); "
-            "starting with an empty booking index. Existing calendar events "
-            "are unaffected, but the agent won't be able to find/cancel them "
-            "by ID or patient details until re-synced.",
-            file=sys.stderr,
-        )
-        return []
+def _build_bookings_store():
+    """Build the real Postgres-backed booking store (via the shared
+    connection pool) if DATABASE_URL is configured, otherwise fall back to
+    a local JSON file (with a loud warning) so the script and the offline
+    tests still run without any database setup."""
+    pool = _get_pg_pool()
+    if pool is not None:
+        return PostgresBookingsStore(pool)
+    print(
+        "WARNING: DATABASE_URL not set -- using a local JSON file for the "
+        "booking index instead of Postgres. This will NOT survive a "
+        "restart/redeploy on a host with no persistent disk (e.g. Render's "
+        "free tier) until DATABASE_URL is configured.",
+        file=sys.stderr,
+    )
+    return JsonFileBookingsStore(BOOKINGS_INDEX_FILE)
 
 
-def _save_bookings_index() -> None:
-    """Called after every booking/cancellation. Best-effort: a failed save
-    shouldn't crash the turn (the patient already has their confirmation),
-    but it does mean this index could drift from reality until the next
-    successful save, so we warn loudly rather than failing silently."""
-    try:
-        BOOKINGS_INDEX_FILE.write_text(
-            json.dumps(BOOKINGS, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-    except OSError as exc:
-        print(f"WARNING: could not save booking index to {BOOKINGS_INDEX_FILE} ({exc}).", file=sys.stderr)
+# Module-level so tests can monkeypatch it (same pattern as calendar_client
+# above) -- swap in a fresh store per test for clean, deterministic,
+# network-free booking persistence every time.
+bookings_store = _build_bookings_store()
+
+BOOKINGS: list[dict] = bookings_store.load_all()
 
 
 def _next_counter_start(bookings: list[dict]) -> int:
@@ -356,8 +520,6 @@ def _next_counter_start(bookings: list[dict]) -> int:
             continue
     return highest
 
-
-BOOKINGS: list[dict] = _load_bookings_index()
 
 _next_id_counter = _next_counter_start(BOOKINGS)
 
@@ -566,18 +728,17 @@ def book_appointment(
         )
 
     appointment_id = _generate_appointment_id()
-    BOOKINGS.append(
-        {
-            "id": appointment_id,
-            "event_id": event_id,
-            "patient_name": patient_name,
-            "phone": phone,
-            "date": date,
-            "time": time,
-            "service": service,
-        }
-    )
-    _save_bookings_index()
+    new_booking = {
+        "id": appointment_id,
+        "event_id": event_id,
+        "patient_name": patient_name,
+        "phone": phone,
+        "date": date,
+        "time": time,
+        "service": service,
+    }
+    BOOKINGS.append(new_booking)
+    bookings_store.add(new_booking)
 
     return (
         f"Appointment confirmed! ID {appointment_id} for {patient_name} "
@@ -696,7 +857,7 @@ def cancel_appointment(appointment_id: str) -> str:
         )
 
     BOOKINGS.remove(booking)
-    _save_bookings_index()
+    bookings_store.remove(booking["id"])
 
     return (
         f"Appointment {appointment_id} for {booking['patient_name']} "
@@ -1129,52 +1290,16 @@ def faq_node(state: SupervisorState):
 # sleeping when idle.
 # ---------------------------------------------------------------------------
 
-# IMPORTANT: this uses a connection POOL (psycopg_pool.ConnectionPool), not
-# a single long-held connection. That's not just a style choice -- a single
-# connection held open for the life of the process WILL eventually go stale
-# (Neon suspends its compute when idle and drops connections; the same can
-# happen from network blips, or Render's server sleeping and waking up),
-# and every request after that would fail with "the connection is closed"
-# until the process was manually restarted. A pool checks each connection's
-# health when it's checked out (via `check=ConnectionPool.check_connection`
-# below) and transparently swaps in a fresh one if the old one died, so a
-# stale connection self-heals on the very next request instead of crashing
-# it. This was verified against a real Postgres instance by deliberately
-# killing the underlying connection mid-run and confirming the next request
-# still succeeds.
-#
-# Holds the ConnectionPool so close_checkpointer() can close it on shutdown
-# without build_graph() having to return it separately. None when running
-# on MemorySaver instead, or before _build_checkpointer() has been called.
-_checkpointer_pool: ConnectionPool | None = None
-
-
 def _build_checkpointer():
-    """Build the real Postgres-backed checkpointer (via a connection pool)
-    if DATABASE_URL is configured, otherwise fall back to an in-memory
+    """Build the real Postgres-backed checkpointer (via the shared
+    connection pool -- see _get_pg_pool() near the top of this file) if
+    DATABASE_URL is configured, otherwise fall back to an in-memory
     stand-in (with a loud warning) so the script and the offline tests
     still run without any database setup. See the module comment above for
     Neon setup steps."""
-    global _checkpointer_pool
-    database_url = os.environ.get("DATABASE_URL")
-    if database_url:
-        _checkpointer_pool = ConnectionPool(
-            conninfo=database_url,
-            # A dental clinic bot handles one conversation at a time per
-            # request, not a high-concurrency workload, and Neon's free
-            # tier caps concurrent connections -- keep this small rather
-            # than defaulting to psycopg_pool's normal (larger) sizing.
-            min_size=1,
-            max_size=5,
-            kwargs={"autocommit": True, "row_factory": dict_row},
-            # Validates a connection when it's checked out of the pool and
-            # transparently replaces it if it's gone stale -- this is the
-            # piece that actually makes the pool self-healing rather than
-            # just "a pool of connections that can still all be dead".
-            check=ConnectionPool.check_connection,
-            open=True,
-        )
-        checkpointer = PostgresSaver(_checkpointer_pool)
+    pool = _get_pg_pool()
+    if pool is not None:
+        checkpointer = PostgresSaver(pool)
         checkpointer.setup()  # idempotent: creates tables on first run, no-ops after
         return checkpointer
     print(
@@ -1185,17 +1310,6 @@ def _build_checkpointer():
         file=sys.stderr,
     )
     return MemorySaver()
-
-
-def close_checkpointer():
-    """Close the Postgres connection pool opened by _build_checkpointer(),
-    if any. Call this on graceful shutdown (see api_server.py's lifespan).
-    Harmless to call even if no pool was ever opened (e.g. running on
-    MemorySaver, or before build_graph() was ever called)."""
-    global _checkpointer_pool
-    if _checkpointer_pool is not None:
-        _checkpointer_pool.close()
-        _checkpointer_pool = None
 
 
 def build_graph():
@@ -1306,7 +1420,7 @@ def main():
 
         print(f"Laia: {reply_text}\n")
 
-    close_checkpointer()
+    close_database()
 
 
 if __name__ == "__main__":
