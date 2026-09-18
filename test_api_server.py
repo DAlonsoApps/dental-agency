@@ -81,6 +81,18 @@ def test_root_serves_the_chat_widget(client):
     assert 'fetch("/chat"' in response.text
 
 
+def test_root_widget_loads_clinic_name_from_health(client):
+    """The widget's title/header must not be permanently hardcoded to the
+    placeholder clinic name -- it should fetch /health on load and update
+    both from the database-backed CLINIC_NAME, so renaming a clinic in the
+    config takes effect on the widget without editing this static file."""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert 'fetch("/health")' in response.text
+    assert "document.title" in response.text
+    assert 'getElementById("chat-header")' in response.text
+
+
 def test_health_endpoint(client):
     response = client.get("/health")
     assert response.status_code == 200

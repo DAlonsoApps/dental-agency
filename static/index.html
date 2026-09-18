@@ -102,6 +102,29 @@
   inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") sendMessage(); });
 
   addMessage("Hi! I'm Laia, the virtual receptionist. How can I help you today?", "bot");
+
+  // The clinic's name lives in the database now (see dental_agent.py's
+  // clinic_config table), not in this static file -- so the "Bright Smile
+  // Dental Clinic" text above is only a fallback, shown until (and unless)
+  // this fetch succeeds. /health already returns {"status": "ok", "clinic":
+  // "..."}, so no new endpoint is needed. If this fails for any reason
+  // (offline, slow network, old cached page), the hardcoded fallback text
+  // just stays put -- the chat itself still works either way.
+  async function loadClinicInfo() {
+    try {
+      const response = await fetch("/health");
+      if (!response.ok) return;
+      const data = await response.json();
+      if (data.clinic) {
+        document.title = data.clinic + " -- Chat with Laia";
+        document.getElementById("chat-header").textContent = data.clinic;
+      }
+    } catch (err) {
+      // Fallback text already in the HTML -- nothing else to do.
+    }
+  }
+
+  loadClinicInfo();
 </script>
 
 </body>
