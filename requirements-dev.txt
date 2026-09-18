@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest>=7.0
+httpx>=0.24.0  # required by FastAPI's TestClient (test_api_server.py)

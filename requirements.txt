@@ -1,0 +1,12 @@
+langgraph>=0.2.0
+langchain-anthropic>=0.3.0
+langchain-core>=0.3.0
+python-dotenv>=1.0.0
+tzdata>=2024.1  # required on Windows: it has no built-in IANA timezone database
+google-api-python-client>=2.100.0  # Google Calendar integration
+google-auth>=2.23.0                # service-account authentication for Google Calendar
+google-auth-httplib2>=0.2.0        # HTTP transport used by google-api-python-client
+fastapi>=0.110.0                   # web API (api_server.py)
+uvicorn[standard]>=0.27.0          # ASGI server to actually run api_server.py
+langgraph-checkpoint-postgres>=2.0.0  # Postgres-backed conversation memory (Neon)
+psycopg[binary,pool]>=3.1.0           # Postgres driver used by langgraph-checkpoint-postgres
