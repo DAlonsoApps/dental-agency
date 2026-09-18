@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bright Smile Dental Clinic -- Chat with Laia</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #f4f4f6; margin: 0; padding: 24px; }
+  #chat-container { max-width: 480px; margin: 0 auto; background: white; border-radius: 12px;
+                     box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; display: flex; flex-direction: column; height: 80vh; }
+  #chat-header { background: #2563eb; color: white; padding: 16px; font-weight: 600; }
+  #chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 80%; padding: 10px 14px; border-radius: 14px; line-height: 1.4; white-space: pre-wrap; }
+  .msg.user { align-self: flex-end; background: #2563eb; color: white; border-bottom-right-radius: 2px; }
+  .msg.bot { align-self: flex-start; background: #e5e7eb; color: #111; border-bottom-left-radius: 2px; }
+  .msg.error { align-self: center; background: #fee2e2; color: #991b1b; font-size: 0.9em; }
+  #chat-input-row { display: flex; border-top: 1px solid #e5e7eb; }
+  #chat-input { flex: 1; border: none; padding: 14px; font-size: 1em; }
+  #chat-input:focus { outline: none; }
+  #chat-send { border: none; background: #2563eb; color: white; padding: 0 20px; cursor: pointer; font-size: 1em; }
+  #chat-send:disabled { background: #93c5fd; cursor: default; }
+</style>
+</head>
+<body>
+
+<div id="chat-container">
+  <div id="chat-header">Bright Smile Dental Clinic</div>
+  <div id="chat-messages"></div>
+  <div id="chat-input-row">
+    <input id="chat-input" type="text" placeholder="Type a message..." autocomplete="off">
+    <button id="chat-send">Send</button>
+  </div>
+</div>
+
+<script>
+  // This page is served BY the same API it talks to (see api_server.py),
+  // so "/chat" below is automatically the right address on whatever host
+  // this page is opened from -- unlike chat_widget_demo.html (the local
+  // testing copy), there is no API_BASE_URL to edit here, ever. That's
+  // the whole point of serving it this way: one URL to share, and it
+  // keeps working through every future redeploy without editing anything.
+
+  // One session_id per browser tab, kept for the lifetime of that tab
+  // (cleared if the tab is closed) -- this is what keeps a conversation's
+  // history together across multiple messages.
+  function getSessionId() {
+    let id = sessionStorage.getItem("dental_agent_session_id");
+    if (!id) {
+      id = "web-" + crypto.randomUUID();
+      sessionStorage.setItem("dental_agent_session_id", id);
+    }
+    return id;
+  }
+
+  const messagesEl = document.getElementById("chat-messages");
+  const inputEl = document.getElementById("chat-input");
+  const sendBtn = document.getElementById("chat-send");
+
+  function addMessage(text, cssClass) {
+    const div = document.createElement("div");
+    div.className = "msg " + cssClass;
+    div.textContent = text;
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  async function sendMessage() {
+    const text = inputEl.value.trim();
+    if (!text) return;
+
+    addMessage(text, "user");
+    inputEl.value = "";
+    sendBtn.disabled = true;
+
+    try {
+      const response = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, session_id: getSessionId() }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        addMessage("Error: " + (body.detail || response.statusText), "error");
+        return;
+      }
+
+      const data = await response.json();
+      addMessage(data.reply, "bot");
+    } catch (err) {
+      addMessage(
+        "Couldn't reach the server (" + err.message + "). Please try again shortly.",
+        "error"
+      );
+    } finally {
+      sendBtn.disabled = false;
+      inputEl.focus();
+    }
+  }
+
+  sendBtn.addEventListener("click", sendMessage);
+  inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") sendMessage(); });
+
+  addMessage("Hi! I'm Laia, the virtual receptionist. How can I help you today?", "bot");
+</script>
+
+</body>
+</html>

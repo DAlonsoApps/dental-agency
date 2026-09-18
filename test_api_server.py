@@ -68,6 +68,19 @@ def client(monkeypatch):
     return TestClient(api_server.app)
 
 
+def test_root_serves_the_chat_widget(client):
+    """The deployed API's own root URL is the shareable client-facing chat
+    link (see static/index.html) -- this locks in that /health and /chat
+    keep taking priority over the static-file mount, and that the widget
+    uses a relative "/chat" path rather than a hardcoded host, so the same
+    page works unmodified on every deploy."""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "chat-container" in response.text
+    assert 'fetch("/chat"' in response.text
+
+
 def test_health_endpoint(client):
     response = client.get("/health")
     assert response.status_code == 200

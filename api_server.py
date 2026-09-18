@@ -45,9 +45,11 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import HumanMessage
@@ -191,3 +193,16 @@ def chat(request: ChatRequest):
     logger.info("session_id=%s latency=%.2fs", request.session_id, latency)
 
     return ChatResponse(reply=reply_text, session_id=request.session_id)
+
+
+# Serves static/index.html at "/" (and anything else dropped into
+# static/), so the deployed API's own URL IS the shareable chat link --
+# e.g. https://dental-agency.onrender.com/ opens the widget directly, with
+# nothing else to host and no separate URL to give out. This is mounted
+# LAST, after /health and /chat are already registered above: FastAPI/
+# Starlette matches routes in registration order, so those two explicit
+# routes still take priority over anything this mount would otherwise
+# claim, and the mount only handles paths neither of them matched (in
+# practice here, just "/"). `html=True` makes it serve index.html for a
+# directory request instead of only exact filenames.
+app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
